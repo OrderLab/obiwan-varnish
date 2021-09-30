@@ -37,6 +37,8 @@
 #include "cache.h"
 
 #include "hash/hash_slinger.h"
+
+#include "orbit.h"
 /*--------------------------------------------------------------------
  * Create and starte a back-ground thread which as its own worker and
  * session data structures;
@@ -84,14 +86,18 @@ WRK_BgThread(pthread_t *thr, const char *name, bgthread_t *func, void *priv)
 
 /*--------------------------------------------------------------------*/
 
+struct orbit_allocator *Pool_ObAlloc(void *priv);
+
 static void *
 wrk_thread_real(void *priv, unsigned thread_workspace)
 {
-	struct worker *w, ww;
+	struct worker *w;
 	unsigned char ws[thread_workspace];
+	struct orbit_allocator *oballoc = Pool_ObAlloc(priv);
 
 	THR_SetName("cache-worker");
-	w = &ww;
+	w = orbit_alloc(oballoc, sizeof(struct worker));
+	AN(w);
 	memset(w, 0, sizeof *w);
 	w->magic = WORKER_MAGIC;
 	w->lastused = NAN;
@@ -112,6 +118,7 @@ wrk_thread_real(void *priv, unsigned thread_workspace)
 		VBO_Free(&w->nbo);
 	HSH_Cleanup(w);
 	Pool_Sumstat(w);
+	orbit_free(oballoc, w);
 	return (NULL);
 }
 

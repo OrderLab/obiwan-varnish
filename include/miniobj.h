@@ -12,10 +12,23 @@
 			(to)->magic = (type_magic);			\
 	} while (0)
 
+#define ALLOC_OBJ_ORBIT(alloc, to, type_magic)				\
+	do {								\
+		(to) = orbit_calloc(alloc, sizeof *(to));		\
+		if ((to) != NULL)					\
+			(to)->magic = (type_magic);			\
+	} while (0)
+
 #define FREE_OBJ(to)							\
 	do {								\
 		(to)->magic = (0);					\
 		free(to);						\
+	} while (0)
+
+#define FREE_OBJ_ORBIT(alloc, to)					\
+	do {								\
+		(to)->magic = (0);					\
+		orbit_free(alloc, to);					\
 	} while (0)
 
 #define VALID_OBJ(ptr, type_magic)					\

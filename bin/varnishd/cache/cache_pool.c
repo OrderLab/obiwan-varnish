@@ -43,6 +43,13 @@
 
 #include "vtim.h"
 
+#include <stdio.h>
+#include "orbit.h"
+
+FILE *obout = NULL;
+
+#define obprintf(fmt, ...) do { fprintf(obout, fmt, ##__VA_ARGS__); } while (0)
+
 VTAILQ_HEAD(taskhead, pool_task);
 
 struct poolsock {
@@ -61,6 +68,10 @@ struct pool {
 
 	pthread_cond_t			herder_cond;
 	pthread_t			herder_thr;
+	struct orbit_module		*herder_ob;
+	struct orbit_pool		*herder_ob_pool;
+	struct orbit_allocator		*herder_ob_alloc;
+	struct orbit_pool		*herder_ob_scratch_pool;
 
 	struct lock			mtx;
 	struct taskhead			idle_queue;
@@ -81,6 +92,13 @@ static pthread_t		thr_pool_herder;
 static unsigned			pool_accepting = 0;
 
 static struct lock		wstat_mtx;
+
+struct orbit_allocator *Pool_ObAlloc(void *priv)
+{
+	struct pool *pp;
+	CAST_OBJ_NOTNULL(pp, priv, POOL_MAGIC);
+	return pp->herder_ob_alloc;
+}
 
 /*--------------------------------------------------------------------
  * Summing of stats into global stats counters
@@ -168,6 +186,7 @@ pool_getidleworker(struct pool *pp)
 	pt = VTAILQ_FIRST(&pp->idle_queue);
 	if (pt == NULL) {
 		if (pp->nthr < cache_param->wthread_max) {
+			obprintf("orbit: not found idle workder, dry++\n");
 			pp->dry++;
 			AZ(pthread_cond_signal(&pp->herder_cond));
 		}
@@ -175,6 +194,7 @@ pool_getidleworker(struct pool *pp)
 	}
 	AZ(pt->func);
 	CAST_OBJ_NOTNULL(wrk, pt->priv, WORKER_MAGIC);
+	obprintf("orbit: found idle workder\n");
 	return (wrk);
 }
 
@@ -217,7 +237,7 @@ pool_accept(struct worker *wrk, void *arg)
 
 		if (ps->lsock->sock < 0) {
 			/* Socket Shutdown */
-			FREE_OBJ(ps);
+			FREE_OBJ_ORBIT(pp->herder_ob_alloc, ps);
 			WS_Release(wrk->aws, 0);
 			return;
 		}
@@ -442,6 +462,204 @@ pool_breed(struct pool *qp, const pthread_attr_t *tp_attr)
 	}
 }
 
+// TODO: rewrite the wrapper with new API
+unsigned long addition_helper(size_t argc, unsigned long argv[]) {
+	*(uint64_t*)argv[0] += (int64_t)argv[1];
+	return 0;
+}
+unsigned long lock_helper(size_t argc, unsigned long argv[]) {
+	Lck_Lock((struct lock*)argv[0]);
+	return 0;
+}
+unsigned long unlock_helper(size_t argc, unsigned long argv[]) {
+	Lck_Unlock((struct lock*)argv[0]);
+	return 0;
+}
+unsigned long signal_helper(size_t argc, unsigned long argv[]) {
+	AZ(pthread_cond_signal((pthread_cond_t*)argv[0]));
+	return 0;
+}
+unsigned long vtailq_remove_helper(size_t argc, unsigned long argv[]) {
+	struct taskhead *head = (struct taskhead *)argv[0];
+	struct pool_task *task = (struct pool_task *)argv[1];
+	VTAILQ_REMOVE(head, task, list);
+	return 0;
+}
+unsigned long sleep_helper(size_t argc, unsigned long argv[]) {
+	VTIM_sleep(*(double*)argv);
+	return 0;
+}
+unsigned long cond_wait_helper(size_t argc, unsigned long argv[]) {
+	(void)Lck_CondWait((pthread_cond_t*)argv[0], (struct lock*)argv[1], VTIM_real() + 5);
+	return 0;
+}
+unsigned long pool_breed_helper(size_t argc, unsigned long argv[]) {
+	struct pool *qp = (struct pool *)argv[0];
+	pthread_attr_t *tp_attr = (pthread_attr_t *)argv[1];
+	pool_breed(qp, tp_attr);
+	return 0;
+}
+
+struct pool_herder_args {
+	struct pool *pp;
+};
+
+static unsigned long pool_herder_orbit(void *store, void *argbuf)
+{
+	struct pool_herder_args *args = (struct pool_herder_args*)argbuf;
+	(void)store;
+
+	struct pool *pp = args->pp;
+	struct pool_task *pt;
+	pthread_attr_t tp_attr;
+	double t_idle;
+	struct worker *wrk;
+
+	struct orbit_scratch scratch;
+	orbit_scratch_create(&scratch);
+
+	AZ(pthread_attr_init(&tp_attr));
+
+	/* Set the stacksize for worker threads we create */
+	if (cache_param->wthread_stacksize != UINT_MAX)
+		AZ(pthread_attr_setstacksize(&tp_attr,
+		    cache_param->wthread_stacksize));
+	else {
+		AZ(pthread_attr_destroy(&tp_attr));
+		AZ(pthread_attr_init(&tp_attr));
+	}
+
+	/* Make more threads if needed and allowed */
+	if (pp->nthr < cache_param->wthread_min ||
+	    (pp->dry && pp->nthr < cache_param->wthread_max)) {
+		pthread_attr_t *tp_attr_s = (pthread_attr_t *)
+		    ((struct orbit_repr*)((char*)scratch.ptr + scratch.cursor))->any.data;
+		orbit_scratch_push_any(&scratch, &tp_attr, sizeof(tp_attr));
+		/* pool_breed(pp, tp_attr_s); */
+		unsigned long argv[] = { (unsigned long)pp, (unsigned long)tp_attr_s, };
+		orbit_scratch_push_operation(&scratch, pool_breed_helper, 2, argv);
+		obprintf("orbit: requested add thread\n");
+		goto end;
+	}
+
+	if (pp->nthr > cache_param->wthread_min) {
+
+		t_idle = VTIM_real() - cache_param->wthread_timeout;
+		obprintf("orbit: t_idle is %f\n", t_idle);
+
+		unsigned long argv[] = { (unsigned long)&pp->mtx, };
+		orbit_scratch_push_operation(&scratch, lock_helper, 1, argv);
+		/* Lck_Lock(&pp->mtx); */
+
+		/* XXX: unsafe counters */
+		unsigned long argv_num[2];
+
+		argv_num[0] = (unsigned long)&VSC_C_main->sess_queued;
+		argv_num[1] = pp->nqueued;
+		/* VSC_C_main->sess_queued += pp->nqueued; */
+		orbit_scratch_push_operation(&scratch, addition_helper, 2, argv_num);
+
+		argv_num[0] = (unsigned long)&VSC_C_main->sess_dropped;
+		argv_num[1] = pp->ndropped;
+		/* VSC_C_main->sess_dropped += pp->ndropped; */
+		orbit_scratch_push_operation(&scratch, addition_helper, 2, argv_num);
+
+		pp->nqueued = pp->ndropped = 0;
+		orbit_scratch_push_update(&scratch, &pp->nqueued, sizeof(pp->nqueued));
+		orbit_scratch_push_update(&scratch, &pp->ndropped, sizeof(pp->ndropped));
+
+		wrk = NULL;
+		pt = VTAILQ_LAST(&pp->idle_queue, taskhead);
+		if (pt != NULL) {
+			obprintf("orbit info: we are in pt != NULL\n");
+			AZ(pt->func);
+			CAST_OBJ_NOTNULL(wrk, pt->priv, WORKER_MAGIC);
+			obprintf("orbit: found one idle, lastused %f\n", wrk->lastused);
+
+			if (wrk->lastused < t_idle ||
+			    pp->nthr > cache_param->wthread_max) {
+				/* Give it a kiss on the cheek... */
+				unsigned long argv[] = { (unsigned long)&pp->idle_queue, (unsigned long)&wrk->task };
+				orbit_scratch_push_operation(&scratch, vtailq_remove_helper, 2, argv);
+				/* VTAILQ_REMOVE(&pp->idle_queue,
+				    &wrk->task, list); */
+				obprintf("orbit: requested kill idle thread\n");
+
+				wrk->task.func = pool_kiss_of_death;
+				orbit_scratch_push_update(&scratch,
+				    &wrk->task.func, sizeof(wrk->task.func));
+
+				argv[0] = (unsigned long)&wrk->cond;
+				orbit_scratch_push_operation(&scratch, signal_helper, 1, argv);
+				/* AZ(pthread_cond_signal(&wrk->cond)); */
+			} else
+				wrk = NULL;
+		}
+		/* Lck_Unlock(&pp->mtx); */
+		orbit_scratch_push_operation(&scratch, unlock_helper, 1, argv);
+
+		if (wrk != NULL) {
+			unsigned long argv[2];
+
+			argv[0] = (unsigned long)&pp->nthr;
+			argv[1] = -1;
+			orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+			/* pp->nthr--; */
+
+			argv[0] = (unsigned long)&pool_mtx;
+			orbit_scratch_push_operation(&scratch, lock_helper, 1, argv);
+			/* Lck_Lock(&pool_mtx); */
+
+			argv[0] = (unsigned long)&VSC_C_main->threads;
+			argv[1] = -1;
+			/* VSC_C_main is using shared memory? */
+			/* VSC_C_main->threads--; */
+			orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+
+			argv[0] = (unsigned long)&VSC_C_main->threads_destroyed;
+			argv[1] = 1;
+			/* VSC_C_main->threads_destroyed++; */
+			orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+
+			/* Lck_Unlock(&pool_mtx); */
+			argv[0] = (unsigned long)&pool_mtx;
+			orbit_scratch_push_operation(&scratch, unlock_helper, 1, argv);
+
+			/* VTIM_sleep(cache_param->wthread_destroy_delay); */
+			void *tmp = (void*)&cache_param->wthread_destroy_delay;
+			argv[0] = *(unsigned long*)tmp;
+			orbit_scratch_push_operation(&scratch, sleep_helper, 1, argv);
+
+			goto end;
+		}
+	}
+
+	unsigned long argv[] = { (unsigned long)&pp->mtx, };
+	orbit_scratch_push_operation(&scratch, lock_helper, 1, argv);
+	/* Lck_Lock(&pp->mtx); */
+	if (!pp->dry) {
+		/* (void)Lck_CondWait(&pp->herder_cond, &pp->mtx,
+			VTIM_real() + 5); */
+		unsigned long argv[] = { (unsigned long)&pp->herder_cond, (unsigned long)&pp->mtx, };
+		orbit_scratch_push_operation(&scratch, cond_wait_helper, 2, argv);
+	} else {
+		/* XXX: unsafe counters */
+		unsigned long argv[] = { (unsigned long)&VSC_C_main->threads_limited, 1, };
+		orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+		/* VSC_C_main->threads_limited++; */
+
+		pp->dry = 0;
+		orbit_scratch_push_update(&scratch, &pp->dry, sizeof(pp->dry));
+	}
+	/* Lck_Unlock(&pp->mtx); */
+	orbit_scratch_push_operation(&scratch, unlock_helper, 1, argv);
+
+end:
+	orbit_sendv(&scratch);
+
+	return 0;
+}
+
 /*--------------------------------------------------------------------
  * Herd a single pool
  *
@@ -461,80 +679,35 @@ static void*
 pool_herder(void *priv)
 {
 	struct pool *pp;
-	struct pool_task *pt;
-	pthread_attr_t tp_attr;
-	double t_idle;
-	struct worker *wrk;
 
 	CAST_OBJ_NOTNULL(pp, priv, POOL_MAGIC);
-	AZ(pthread_attr_init(&tp_attr));
+
+	pthread_setname_np(pthread_self(), "pool_herder");
 
 	while (1) {
-		/* Set the stacksize for worker threads we create */
-		if (cache_param->wthread_stacksize != UINT_MAX)
-			AZ(pthread_attr_setstacksize(&tp_attr,
-			    cache_param->wthread_stacksize));
-		else {
-			AZ(pthread_attr_destroy(&tp_attr));
-			AZ(pthread_attr_init(&tp_attr));
-		}
+		struct pool_herder_args args = (struct pool_herder_args) {
+			.pp = pp,
+		};
+		struct orbit_task task;
+		union orbit_result result;
+		int ret;
 
-		/* Make more threads if needed and allowed */
-		if (pp->nthr < cache_param->wthread_min ||
-		    (pp->dry && pp->nthr < cache_param->wthread_max)) {
-			pool_breed(pp, &tp_attr);
-			continue;
-		}
+		// FIXME: make orbit call without holding a lock may snapshot
+		// inconsistent view of data.
+		ret = orbit_call_async(pp->herder_ob, 0, 1, &pp->herder_ob_pool,
+				NULL, &args, sizeof(args), &task);
+		AZ(ret);
 
-		if (pp->nthr > cache_param->wthread_min) {
+		ret = orbit_recvv(&result, &task);
+		assert(ret == 1);
+		// TODO: check return value of apply
+		orbit_apply(&result.scratch, false);
 
-			t_idle = VTIM_real() - cache_param->wthread_timeout;
-
-			Lck_Lock(&pp->mtx);
-			/* XXX: unsafe counters */
-			VSC_C_main->sess_queued += pp->nqueued;
-			VSC_C_main->sess_dropped += pp->ndropped;
-			pp->nqueued = pp->ndropped = 0;
-
-			wrk = NULL;
-			pt = VTAILQ_LAST(&pp->idle_queue, taskhead);
-			if (pt != NULL) {
-				AZ(pt->func);
-				CAST_OBJ_NOTNULL(wrk, pt->priv, WORKER_MAGIC);
-
-				if (wrk->lastused < t_idle ||
-				    pp->nthr > cache_param->wthread_max) {
-					/* Give it a kiss on the cheek... */
-					VTAILQ_REMOVE(&pp->idle_queue,
-					    &wrk->task, list);
-					wrk->task.func = pool_kiss_of_death;
-					AZ(pthread_cond_signal(&wrk->cond));
-				} else
-					wrk = NULL;
-			}
-			Lck_Unlock(&pp->mtx);
-
-			if (wrk != NULL) {
-				pp->nthr--;
-				Lck_Lock(&pool_mtx);
-				VSC_C_main->threads--;
-				VSC_C_main->threads_destroyed++;
-				Lck_Unlock(&pool_mtx);
-				VTIM_sleep(cache_param->wthread_destroy_delay);
-				continue;
-			}
-		}
-
-		Lck_Lock(&pp->mtx);
-		if (!pp->dry) {
-			(void)Lck_CondWait(&pp->herder_cond, &pp->mtx,
-				VTIM_real() + 5);
-		} else {
-			/* XXX: unsafe counters */
-			VSC_C_main->threads_limited++;
-			pp->dry = 0;
-		}
-		Lck_Unlock(&pp->mtx);
+		ret = orbit_recvv(&result, &task);
+		assert(ret == 0);
+		obprintf("orbit: call return result %ld\n", result.retval);
+		obprintf("orbit: #thd %ld, created %ld destoryed %ld\n", VSC_C_main->threads,
+			VSC_C_main->threads_created, VSC_C_main->threads_destroyed);
 	}
 	NEEDLESS_RETURN(NULL);
 }
@@ -550,7 +723,20 @@ pool_mkpool(unsigned pool_no)
 	struct listen_sock *ls;
 	struct poolsock *ps;
 
-	ALLOC_OBJ(pp, POOL_MAGIC);
+	struct orbit_pool *obpool;
+	struct orbit_allocator *oballoc;
+
+	if (obout == NULL) {
+		obout = fopen("/tmp/obout.log", "w");
+		setbuf(obout, NULL);
+	}
+
+	obpool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+	AN(obpool);
+	oballoc = orbit_allocator_from_pool(obpool, true);
+	AN(oballoc);
+
+	ALLOC_OBJ_ORBIT(oballoc, pp, POOL_MAGIC);
 	if (pp == NULL)
 		return (NULL);
 	pp->a_stat = calloc(1, sizeof *pp->a_stat);
@@ -558,6 +744,13 @@ pool_mkpool(unsigned pool_no)
 	pp->b_stat = calloc(1, sizeof *pp->b_stat);
 	AN(pp->b_stat);
 	Lck_New(&pp->mtx, lck_wq);
+
+        /* This needs to be done before herder_thr create */
+	pp->herder_ob_pool = obpool;
+	pp->herder_ob_alloc = oballoc;
+	AN(pp->herder_ob_scratch_pool = orbit_pool_create(NULL, 64 * 1024 * 1024));
+	AZ(orbit_scratch_set_pool(pp->herder_ob_scratch_pool));
+	AN(pp->herder_ob = orbit_create("pool herder", pool_herder_orbit, NULL));
 
 	VTAILQ_INIT(&pp->idle_queue);
 	VTAILQ_INIT(&pp->front_queue);
@@ -570,7 +763,7 @@ pool_mkpool(unsigned pool_no)
 	VTAILQ_FOREACH(ls, &heritage.socks, list) {
 		if (ls->sock < 0)
 			continue;
-		ALLOC_OBJ(ps, POOLSOCK_MAGIC);
+		ALLOC_OBJ_ORBIT(oballoc, ps, POOLSOCK_MAGIC);
 		XXXAN(ps);
 		ps->lsock = ls;
 		ps->task.func = pool_accept;

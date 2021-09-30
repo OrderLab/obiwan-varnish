@@ -66,6 +66,7 @@ mgt_sandbox_unix(enum sandbox_e who)
 #define NGID 2000
 	int i;
 	gid_t gid_list[NGID];
+        return;
 
 	if (geteuid() != 0) {
 		REPORT0(LOG_INFO, "Not running as root, no priv-sep");
@@ -93,6 +94,7 @@ mgt_sandbox_unix(enum sandbox_e who)
 static void __match_proto__(mgt_sandbox_f)
 mgt_sandbox_linux(enum sandbox_e who)
 {
+        return;
 	mgt_sandbox_unix(who);
 
 	if (prctl(PR_SET_DUMPABLE, 1) != 0) {
