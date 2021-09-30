@@ -1,0 +1,108 @@
+# Matches ALL Makefile and Makefile.in occurrences 
+Makefile
+Makefile.in
+
+# ...
+.deps/
+.libs/
+*.o
+*.lo
+*.la
+*~
+*.sw[op]
+*.trs
+
+
+# Various auto-tools artifacts
+/aclocal.m4
+/autom4te.cache/
+/compile
+/config.guess
+/config.h
+/config.h.in
+/config.h.in~
+/config.log
+/config.status
+/config.sub
+/configure
+/configure.lineno
+/depcomp
+/install-sh
+/libtool
+/ltmain.sh
+/m4/libtool.m4
+/m4/ltoptions.m4
+/m4/ltsugar.m4
+/m4/ltversion.m4
+/m4/lt~obsolete.m4
+/missing
+/stamp-h1
+/varnishapi.pc
+/build-aux
+TAGS
+tags
+cscope.*out
+#
+/varnishapi-uninstalled.pc
+
+# Default vcl made from bin/varnishd/default.vcl
+/bin/varnishd/builtin_vcl.h
+/etc/builtin.vcl
+
+# Various auto-generated code snippets
+/include/vcl.h
+/include/vrt_obj.h
+/include/vmod_abi.h
+/include/tbl/vcl_returns.h
+/include/tbl/vrt_stv_var.h
+/include/tbl/vcc_types.h
+/include/vcs_version.h
+/lib/libvcc/vcc_fixed_token.c
+/lib/libvcc/vcc_obj.c
+/lib/libvcc/vcc_token_defs.h
+/lib/libvarnish/vnum_c_test
+/lib/libvarnish/vnum_c_test.log
+/lib/libvarnish/test-suite.log
+/lib/libvarnishapi/vxp_fixed_token.c
+/lib/libvarnishapi/vxp_tokens.h
+/lib/libvarnishapi/vsl2rst
+/lib/libvarnishapi/vsl-tags.rst
+
+
+# Misc. generated files for included vmods.
+/lib/libvmod_*/vcc_if.c
+/lib/libvmod_*/vcc_if.h
+/lib/libvmod_*/vmod_*.rst
+
+
+# Man-files and binaries
+/man/vsc2rst
+/man/*.1
+/man/*.3
+/man/*.7
+/doc/sphinx/include
+/doc/sphinx/*/*generated.rst
+/bin/varnish*/varnish*_opt2rst
+/bin/varnishadm/varnishadm
+/bin/varnishd/varnishd
+/bin/varnishhist/varnishhist
+/bin/varnishlog/varnishlog
+/bin/varnishncsa/varnishncsa
+/bin/varnishreplay/varnishreplay
+/bin/varnishstat/varnishstat
+/bin/varnishtest/varnishtest
+/bin/varnishtop/varnishtop
+
+# Doc-stuff generated from xml
+/doc/*.html
+/doc/sphinx/build/
+/doc/sphinx/conf.py
+/doc/sphinx/include/vcl_var.rst
+
+# NetBeans insists on this
+/nbproject/private/
+
+# Test droppings
+/bin/varnishtest/tests/*.log
+/bin/varnishtest/tests/*.log-t
+/bin/varnishtest/test-suite.log

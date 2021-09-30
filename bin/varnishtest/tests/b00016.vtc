@@ -1,0 +1,42 @@
+varnishtest "Check naming of backends"
+
+server s1 {
+	rxreq
+	txresp
+} -start
+
+varnish v1 -vcl+backend {
+
+	sub vcl_backend_response {
+	    set beresp.http.X-Backend-Name = bereq.backend;
+	}
+} -start
+
+client c1 {
+	txreq -url "/"
+	rxresp
+	expect resp.http.X-Backend-Name == "s1"
+} -run
+
+varnish v1 -vcl+backend {
+	import ${vmod_directors};
+
+	sub vcl_init {
+		new bar = directors.random();
+		bar.add_backend(s1, 1);
+	}
+
+	sub vcl_recv {
+		set req.backend_hint = bar.backend();
+	}
+
+	sub vcl_backend_response {
+		set beresp.http.X-Backend-Name = bereq.backend;
+	}
+}
+
+client c1 {
+	txreq -url "/"
+	rxresp
+	expect resp.http.X-Backend-Name == "s1"
+} -run

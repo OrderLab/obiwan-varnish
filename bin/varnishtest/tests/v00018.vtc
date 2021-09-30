@@ -1,0 +1,109 @@
+varnishtest "VCL compiler coverage test: vcc_action.c"
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_hit { return (restart) ; }
+	sub vcl_miss { rollback; return (restart); }
+}
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_miss { return(synth(100,req.url)); }
+	sub vcl_hit { return(synth(100,"the butter please")); }
+}
+
+varnish v1 -errvcl {Variable 'now' is read only.} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_miss { set now = 1000; }
+}
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { set beresp.ttl /= 2; }
+}
+
+varnish v1 -errvcl {Expected '=' got '>>'} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { set beresp.ttl >>= 2; }
+}
+
+varnish v1 -errvcl {Expected '=' got '+='} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_fetch { set bereq.backend += b; }
+}
+
+varnish v1 -errvcl {Expected '=' got '+='} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { set req.url += now; }
+}
+
+varnish v1 -errvcl {Expected ';' got 'if'} {
+	backend b { .host = "127.0.0.1"; }
+	/* XXX: This should not really be an synth */
+	sub vcl_recv { set req.url = "foo" if "bar"; }
+}
+
+varnish v1 -errvcl {Symbol not found: 'req.hash' (expected type STRING_LIST):} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_hash { hash_data(req.hash); }
+}
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { set req.url = 1; }
+}
+
+varnish v1 -errvcl {Expected '=' got '+='} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { set beresp.do_gzip += 1; }
+}
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { set beresp.do_gzip = true; }
+}
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { set beresp.do_gzip = false; }
+}
+
+varnish v1 -errvcl {Symbol not found: 'mu' (expected type BOOL):} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { set beresp.do_gzip = mu; }
+}
+
+varnish v1 -errvcl {Only HTTP header variables can be unset.} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_backend_response { unset beresp.do_gzip; }
+}
+
+varnish v1 -errvcl {Unknown token '<<' when looking for STRING} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { ban (<<); }
+}
+
+varnish v1 -errvcl {Expected an action, 'if', '{' or '}'} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { ban_hash (if); }
+}
+
+varnish v1 -vcl {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { ban ("req.url ~ foo"); }
+}
+
+varnish v1 -errvcl {Expected an action, 'if', '{' or '}'} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { kluf ; }
+}
+
+varnish v1 -errvcl {Unknown token '<<' when looking for STRING_LIST} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_synth { synthetic( << "foo"; }
+}
+
+varnish v1 -errvcl {Syntax has changed, use:} {
+	backend b { .host = "127.0.0.1"; }
+	sub vcl_recv { return(synth); }
+}
