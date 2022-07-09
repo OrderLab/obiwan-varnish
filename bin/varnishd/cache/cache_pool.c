@@ -48,7 +48,11 @@
 
 FILE *obout = NULL;
 
+#if 0
 #define obprintf(fmt, ...) do { fprintf(obout, fmt, ##__VA_ARGS__); } while (0)
+#else
+#define obprintf(fmt, ...) do { } while (0)
+#endif
 
 VTAILQ_HEAD(taskhead, pool_task);
 
@@ -694,11 +698,16 @@ pool_herder(void *priv)
 
 		// FIXME: make orbit call without holding a lock may snapshot
 		// inconsistent view of data.
-		ret = orbit_call_async(pp->herder_ob, 0, 1, &pp->herder_ob_pool,
+		long flags = (1<<8);
+		// long flags = 0;
+		ret = orbit_call_async(pp->herder_ob, flags, 1, &pp->herder_ob_pool,
 				NULL, &args, sizeof(args), &task);
 		AZ(ret);
 
 		ret = orbit_recvv(&result, &task);
+		int err = errno;
+		fprintf(stderr, "orbit: ret = %d, err = %s\n", ret, strerror(err));
+		// while (1) sleep(1);
 		assert(ret == 1);
 		// TODO: check return value of apply
 		orbit_apply(&result.scratch, false);
@@ -716,6 +725,9 @@ pool_herder(void *priv)
  * Add a thread pool
  */
 
+struct orbit_pool *global_obpool = NULL;
+struct orbit_allocator *global_oballoc = NULL;
+
 static struct pool *
 pool_mkpool(unsigned pool_no)
 {
@@ -731,9 +743,13 @@ pool_mkpool(unsigned pool_no)
 		setbuf(obout, NULL);
 	}
 
-	obpool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+	if (global_obpool == NULL)
+		global_obpool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+	obpool = global_obpool;
 	AN(obpool);
-	oballoc = orbit_allocator_from_pool(obpool, true);
+	if (global_oballoc == NULL)
+		global_oballoc = orbit_allocator_from_pool(obpool, true);
+	oballoc = global_oballoc;
 	AN(oballoc);
 
 	ALLOC_OBJ_ORBIT(oballoc, pp, POOL_MAGIC);

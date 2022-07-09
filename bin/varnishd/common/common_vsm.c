@@ -46,6 +46,8 @@
 #include "vmb.h"
 #include "vtim.h"
 
+#include "orbit.h"
+
 /*--------------------------------------------------------------------*/
 
 struct vsm_range {
@@ -189,6 +191,9 @@ VSM_common_cleaner(struct vsm_sc *sc, struct VSC_C_main *stats)
  * Allocate a chunk from VSM
  */
 
+extern struct orbit_pool *global_obpool;
+extern struct orbit_allocator *global_oballoc;
+
 void *
 VSM_common_alloc(struct vsm_sc *sc, ssize_t size,
     const char *class, const char *type, const char *ident)
@@ -209,6 +214,13 @@ VSM_common_alloc(struct vsm_sc *sc, ssize_t size,
 
 	l1 = RUP2(size + sizeof(struct VSM_chunk), 16);
 	l2 = RUP2(size + 2 * sizeof(struct VSM_chunk), 16);
+
+	if (global_obpool == NULL)
+		global_obpool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+	AN(global_obpool);
+	if (global_oballoc == NULL)
+		global_oballoc = orbit_allocator_from_pool(global_obpool, true);
+	AN(global_oballoc);
 
 	/* Find space in free-list */
 	VTAILQ_FOREACH_SAFE(vr, &sc->r_free, list, vr2) {
@@ -237,7 +249,8 @@ VSM_common_alloc(struct vsm_sc *sc, ssize_t size,
 		 */
 		ALLOC_OBJ(vr, VSM_RANGE_MAGIC);
 		AN(vr);
-		vr->ptr = calloc(size, 1);
+		// vr->ptr = calloc(size, 1);
+		vr->ptr = orbit_calloc(global_oballoc, size);
 		AN(vr->ptr);
 		vr->len = size;
 		VTAILQ_INSERT_TAIL(&sc->r_bogus, vr, list);
