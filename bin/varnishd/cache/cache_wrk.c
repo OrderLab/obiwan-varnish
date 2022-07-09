@@ -86,17 +86,17 @@ WRK_BgThread(pthread_t *thr, const char *name, bgthread_t *func, void *priv)
 
 /*--------------------------------------------------------------------*/
 
-struct orbit_allocator *Pool_ObAlloc(void *priv);
+struct orbit_area *Pool_ObArea(void *priv);
 
 static void *
 wrk_thread_real(void *priv, unsigned thread_workspace)
 {
 	struct worker *w;
 	unsigned char ws[thread_workspace];
-	struct orbit_allocator *oballoc = Pool_ObAlloc(priv);
+	struct orbit_area *obarea = Pool_ObArea(priv);
 
 	THR_SetName("cache-worker");
-	w = orbit_alloc(oballoc, sizeof(struct worker));
+	w = orbit_alloc(obarea, sizeof(struct worker));
 	AN(w);
 	memset(w, 0, sizeof *w);
 	w->magic = WORKER_MAGIC;
@@ -118,7 +118,7 @@ wrk_thread_real(void *priv, unsigned thread_workspace)
 		VBO_Free(&w->nbo);
 	HSH_Cleanup(w);
 	Pool_Sumstat(w);
-	orbit_free(oballoc, w);
+	orbit_free(obarea, w);
 	return (NULL);
 }
 

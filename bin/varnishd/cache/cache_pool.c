@@ -68,10 +68,9 @@ struct pool {
 
 	pthread_cond_t			herder_cond;
 	pthread_t			herder_thr;
-	struct orbit_module		*herder_ob;
-	struct orbit_pool		*herder_ob_pool;
-	struct orbit_allocator		*herder_ob_alloc;
-	struct orbit_pool		*herder_ob_scratch_pool;
+	struct orbit			*herder_ob;
+	struct orbit_area		*herder_ob_area;
+	struct orbit_area		*herder_ob_scratch_area;
 
 	struct lock			mtx;
 	struct taskhead			idle_queue;
@@ -93,11 +92,11 @@ static unsigned			pool_accepting = 0;
 
 static struct lock		wstat_mtx;
 
-struct orbit_allocator *Pool_ObAlloc(void *priv)
+struct orbit_area *Pool_ObArea(void *priv)
 {
 	struct pool *pp;
 	CAST_OBJ_NOTNULL(pp, priv, POOL_MAGIC);
-	return pp->herder_ob_alloc;
+	return pp->herder_ob_area;
 }
 
 /*--------------------------------------------------------------------
@@ -237,7 +236,7 @@ pool_accept(struct worker *wrk, void *arg)
 
 		if (ps->lsock->sock < 0) {
 			/* Socket Shutdown */
-			FREE_OBJ_ORBIT(pp->herder_ob_alloc, ps);
+			FREE_OBJ_ORBIT(pp->herder_ob_area, ps);
 			WS_Release(wrk->aws, 0);
 			return;
 		}
@@ -462,49 +461,64 @@ pool_breed(struct pool *qp, const pthread_attr_t *tp_attr)
 	}
 }
 
+#define define_helper1(func, type1, name1, body) \
+	struct func##_helper_args { \
+		type1 name1; \
+	}; \
+	unsigned long func##_helper(void *args_) { \
+		struct func##_helper_args *args = args_; \
+		type1 name1 = args->name1; \
+		body; \
+		return 0; \
+	} \
+	static inline int call_##func##_helper(struct orbit_update *scratch, type1 name1) { \
+		struct func##_helper_args args = { name1, }; \
+		return orbit_update_add_operation(scratch, func##_helper, &args, sizeof(args)); \
+	}
+
+#define define_helper2(func, type1, name1, type2, name2, body) \
+	struct func##_helper_args { \
+		type1 name1; \
+		type2 name2; \
+	}; \
+	unsigned long func##_helper(void *args_) { \
+		struct func##_helper_args *args = args_; \
+		type1 name1 = args->name1; \
+		type2 name2 = args->name2; \
+		body; \
+		return 0; \
+	} \
+	static inline int call_##func##_helper(struct orbit_update *scratch, type1 name1, type2 name2) { \
+		struct func##_helper_args args = { name1, name2, }; \
+		return orbit_update_add_operation(scratch, func##_helper, &args, sizeof(args)); \
+	}
+
+
 // TODO: rewrite the wrapper with new API
-unsigned long addition_helper(size_t argc, unsigned long argv[]) {
-	*(uint64_t*)argv[0] += (int64_t)argv[1];
-	return 0;
-}
-unsigned long lock_helper(size_t argc, unsigned long argv[]) {
-	Lck_Lock((struct lock*)argv[0]);
-	return 0;
-}
-unsigned long unlock_helper(size_t argc, unsigned long argv[]) {
-	Lck_Unlock((struct lock*)argv[0]);
-	return 0;
-}
-unsigned long signal_helper(size_t argc, unsigned long argv[]) {
-	AZ(pthread_cond_signal((pthread_cond_t*)argv[0]));
-	return 0;
-}
-unsigned long vtailq_remove_helper(size_t argc, unsigned long argv[]) {
-	struct taskhead *head = (struct taskhead *)argv[0];
-	struct pool_task *task = (struct pool_task *)argv[1];
-	VTAILQ_REMOVE(head, task, list);
-	return 0;
-}
-unsigned long sleep_helper(size_t argc, unsigned long argv[]) {
-	VTIM_sleep(*(double*)argv);
-	return 0;
-}
-unsigned long cond_wait_helper(size_t argc, unsigned long argv[]) {
-	(void)Lck_CondWait((pthread_cond_t*)argv[0], (struct lock*)argv[1], VTIM_real() + 5);
-	return 0;
-}
-unsigned long pool_breed_helper(size_t argc, unsigned long argv[]) {
-	struct pool *qp = (struct pool *)argv[0];
-	pthread_attr_t *tp_attr = (pthread_attr_t *)argv[1];
-	pool_breed(qp, tp_attr);
-	return 0;
-}
+define_helper2(add_u64, uint64_t*, lhs, uint64_t, rhs, { *lhs += rhs; })
+define_helper2(add_uint, unsigned int*, lhs, unsigned int, rhs, { *lhs += rhs; })
+define_helper1(lock, struct lock*, lock, { Lck_Lock(lock); })
+define_helper1(unlock, struct lock*, lock, { Lck_Unlock(lock); })
+define_helper1(signal, pthread_cond_t*, cond, { AZ(pthread_cond_signal(cond)); })
+define_helper2(vtailq_remove, struct taskhead *, head, struct pool_task *, task, {
+		VTAILQ_REMOVE(head, task, list);
+	})
+define_helper1(sleep, double, t, { VTIM_sleep(t); })
+define_helper2(cond_wait, pthread_cond_t*, cond, struct lock*, lock, {
+		(void)Lck_CondWait(cond, lock, VTIM_real() + 5);
+	})
+
+define_helper2(pool_breed, struct pool *, qp, pthread_attr_t *, tp_attr, {
+		pool_breed(qp, tp_attr);
+	})
 
 struct pool_herder_args {
 	struct pool *pp;
 };
 
-static unsigned long pool_herder_orbit(void *store, void *argbuf)
+struct orbit_update scratch;
+
+static struct orbit_result pool_herder_orbit(void *store, void *argbuf)
 {
 	struct pool_herder_args *args = (struct pool_herder_args*)argbuf;
 	(void)store;
@@ -515,8 +529,7 @@ static unsigned long pool_herder_orbit(void *store, void *argbuf)
 	double t_idle;
 	struct worker *wrk;
 
-	struct orbit_scratch scratch;
-	orbit_scratch_create(&scratch);
+	orbit_update_create(&scratch);
 
 	AZ(pthread_attr_init(&tp_attr));
 
@@ -532,12 +545,10 @@ static unsigned long pool_herder_orbit(void *store, void *argbuf)
 	/* Make more threads if needed and allowed */
 	if (pp->nthr < cache_param->wthread_min ||
 	    (pp->dry && pp->nthr < cache_param->wthread_max)) {
-		pthread_attr_t *tp_attr_s = (pthread_attr_t *)
-		    ((struct orbit_repr*)((char*)scratch.ptr + scratch.cursor))->any.data;
-		orbit_scratch_push_any(&scratch, &tp_attr, sizeof(tp_attr));
+		pthread_attr_t *tp_attr_s =
+			orbit_update_add_data(&scratch, &tp_attr, sizeof(tp_attr));
 		/* pool_breed(pp, tp_attr_s); */
-		unsigned long argv[] = { (unsigned long)pp, (unsigned long)tp_attr_s, };
-		orbit_scratch_push_operation(&scratch, pool_breed_helper, 2, argv);
+		call_pool_breed_helper(&scratch, pp, tp_attr_s);
 		obprintf("orbit: requested add thread\n");
 		goto end;
 	}
@@ -547,26 +558,20 @@ static unsigned long pool_herder_orbit(void *store, void *argbuf)
 		t_idle = VTIM_real() - cache_param->wthread_timeout;
 		obprintf("orbit: t_idle is %f\n", t_idle);
 
-		unsigned long argv[] = { (unsigned long)&pp->mtx, };
-		orbit_scratch_push_operation(&scratch, lock_helper, 1, argv);
+		call_lock_helper(&scratch, &pp->mtx);
 		/* Lck_Lock(&pp->mtx); */
 
 		/* XXX: unsafe counters */
-		unsigned long argv_num[2];
 
-		argv_num[0] = (unsigned long)&VSC_C_main->sess_queued;
-		argv_num[1] = pp->nqueued;
 		/* VSC_C_main->sess_queued += pp->nqueued; */
-		orbit_scratch_push_operation(&scratch, addition_helper, 2, argv_num);
+		call_add_u64_helper(&scratch, &VSC_C_main->sess_queued, pp->nqueued);
 
-		argv_num[0] = (unsigned long)&VSC_C_main->sess_dropped;
-		argv_num[1] = pp->ndropped;
 		/* VSC_C_main->sess_dropped += pp->ndropped; */
-		orbit_scratch_push_operation(&scratch, addition_helper, 2, argv_num);
+		call_add_u64_helper(&scratch, &VSC_C_main->sess_dropped, pp->ndropped);
 
 		pp->nqueued = pp->ndropped = 0;
-		orbit_scratch_push_update(&scratch, &pp->nqueued, sizeof(pp->nqueued));
-		orbit_scratch_push_update(&scratch, &pp->ndropped, sizeof(pp->ndropped));
+		orbit_update_add_modify(&scratch, &pp->nqueued, sizeof(pp->nqueued));
+		orbit_update_add_modify(&scratch, &pp->ndropped, sizeof(pp->ndropped));
 
 		wrk = NULL;
 		pt = VTAILQ_LAST(&pp->idle_queue, taskhead);
@@ -579,85 +584,66 @@ static unsigned long pool_herder_orbit(void *store, void *argbuf)
 			if (wrk->lastused < t_idle ||
 			    pp->nthr > cache_param->wthread_max) {
 				/* Give it a kiss on the cheek... */
-				unsigned long argv[] = { (unsigned long)&pp->idle_queue, (unsigned long)&wrk->task };
-				orbit_scratch_push_operation(&scratch, vtailq_remove_helper, 2, argv);
+				call_vtailq_remove_helper(&scratch, &pp->idle_queue, &wrk->task);
 				/* VTAILQ_REMOVE(&pp->idle_queue,
 				    &wrk->task, list); */
 				obprintf("orbit: requested kill idle thread\n");
 
 				wrk->task.func = pool_kiss_of_death;
-				orbit_scratch_push_update(&scratch,
+				orbit_update_add_modify(&scratch,
 				    &wrk->task.func, sizeof(wrk->task.func));
 
-				argv[0] = (unsigned long)&wrk->cond;
-				orbit_scratch_push_operation(&scratch, signal_helper, 1, argv);
+				call_signal_helper(&scratch, &wrk->cond);
 				/* AZ(pthread_cond_signal(&wrk->cond)); */
 			} else
 				wrk = NULL;
 		}
 		/* Lck_Unlock(&pp->mtx); */
-		orbit_scratch_push_operation(&scratch, unlock_helper, 1, argv);
+		call_unlock_helper(&scratch, &pp->mtx);
 
 		if (wrk != NULL) {
-			unsigned long argv[2];
-
-			argv[0] = (unsigned long)&pp->nthr;
-			argv[1] = -1;
-			orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+			call_add_uint_helper(&scratch, &pp->nthr, -1);
 			/* pp->nthr--; */
 
-			argv[0] = (unsigned long)&pool_mtx;
-			orbit_scratch_push_operation(&scratch, lock_helper, 1, argv);
+			call_lock_helper(&scratch, &pool_mtx);
 			/* Lck_Lock(&pool_mtx); */
 
-			argv[0] = (unsigned long)&VSC_C_main->threads;
-			argv[1] = -1;
 			/* VSC_C_main is using shared memory? */
 			/* VSC_C_main->threads--; */
-			orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+			call_add_u64_helper(&scratch, &VSC_C_main->threads, -1);
 
-			argv[0] = (unsigned long)&VSC_C_main->threads_destroyed;
-			argv[1] = 1;
 			/* VSC_C_main->threads_destroyed++; */
-			orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+			call_add_u64_helper(&scratch, &VSC_C_main->threads_destroyed, 1);
 
 			/* Lck_Unlock(&pool_mtx); */
-			argv[0] = (unsigned long)&pool_mtx;
-			orbit_scratch_push_operation(&scratch, unlock_helper, 1, argv);
+			call_unlock_helper(&scratch, &pool_mtx);
 
 			/* VTIM_sleep(cache_param->wthread_destroy_delay); */
-			void *tmp = (void*)&cache_param->wthread_destroy_delay;
-			argv[0] = *(unsigned long*)tmp;
-			orbit_scratch_push_operation(&scratch, sleep_helper, 1, argv);
+			call_sleep_helper(&scratch, cache_param->wthread_destroy_delay);
 
 			goto end;
 		}
 	}
 
-	unsigned long argv[] = { (unsigned long)&pp->mtx, };
-	orbit_scratch_push_operation(&scratch, lock_helper, 1, argv);
+	call_lock_helper(&scratch, &pp->mtx);
 	/* Lck_Lock(&pp->mtx); */
 	if (!pp->dry) {
 		/* (void)Lck_CondWait(&pp->herder_cond, &pp->mtx,
 			VTIM_real() + 5); */
-		unsigned long argv[] = { (unsigned long)&pp->herder_cond, (unsigned long)&pp->mtx, };
-		orbit_scratch_push_operation(&scratch, cond_wait_helper, 2, argv);
+		call_cond_wait_helper(&scratch, &pp->herder_cond, &pp->mtx);
 	} else {
 		/* XXX: unsafe counters */
-		unsigned long argv[] = { (unsigned long)&VSC_C_main->threads_limited, 1, };
-		orbit_scratch_push_operation(&scratch, addition_helper, 2, argv);
+		call_add_u64_helper(&scratch, &VSC_C_main->threads_limited, 1);
 		/* VSC_C_main->threads_limited++; */
 
 		pp->dry = 0;
-		orbit_scratch_push_update(&scratch, &pp->dry, sizeof(pp->dry));
+		orbit_update_add_modify(&scratch, &pp->dry, sizeof(pp->dry));
 	}
 	/* Lck_Unlock(&pp->mtx); */
-	orbit_scratch_push_operation(&scratch, unlock_helper, 1, argv);
+	call_unlock_helper(&scratch, &pp->mtx);
 
 end:
-	orbit_sendv(&scratch);
-
-	return 0;
+	return (struct orbit_result) { 0, &scratch };
 }
 
 /*--------------------------------------------------------------------
@@ -688,24 +674,21 @@ pool_herder(void *priv)
 		struct pool_herder_args args = (struct pool_herder_args) {
 			.pp = pp,
 		};
-		struct orbit_task task;
-		union orbit_result result;
+		struct orbit_future future;
+		struct orbit_result result;
 		int ret;
 
 		// FIXME: make orbit call without holding a lock may snapshot
 		// inconsistent view of data.
-		ret = orbit_call_async(pp->herder_ob, 0, 1, &pp->herder_ob_pool,
-				NULL, &args, sizeof(args), &task);
+		ret = orbit_call_async(pp->herder_ob, 0, 1, &pp->herder_ob_area,
+				NULL, &args, sizeof(args), &future);
 		AZ(ret);
 
-		ret = orbit_recvv(&result, &task);
+		ret = pull_orbit(&result, &future);
 		assert(ret == 1);
 		// TODO: check return value of apply
-		orbit_apply(&result.scratch, false);
+		orbit_apply(result.update, false);
 
-		ret = orbit_recvv(&result, &task);
-		assert(ret == 0);
-		obprintf("orbit: call return result %ld\n", result.retval);
 		obprintf("orbit: #thd %ld, created %ld destoryed %ld\n", VSC_C_main->threads,
 			VSC_C_main->threads_created, VSC_C_main->threads_destroyed);
 	}
@@ -723,20 +706,17 @@ pool_mkpool(unsigned pool_no)
 	struct listen_sock *ls;
 	struct poolsock *ps;
 
-	struct orbit_pool *obpool;
-	struct orbit_allocator *oballoc;
+	struct orbit_area *obarea;
 
 	if (obout == NULL) {
 		obout = fopen("/tmp/obout.log", "w");
 		setbuf(obout, NULL);
 	}
 
-	obpool = orbit_pool_create(NULL, 64 * 1024 * 1024);
-	AN(obpool);
-	oballoc = orbit_allocator_from_pool(obpool, true);
-	AN(oballoc);
+	obarea = orbit_area_create(NULL, 64 * 1024 * 1024, orbit_bitmap_default);
+	AN(obarea);
 
-	ALLOC_OBJ_ORBIT(oballoc, pp, POOL_MAGIC);
+	ALLOC_OBJ_ORBIT(obarea, pp, POOL_MAGIC);
 	if (pp == NULL)
 		return (NULL);
 	pp->a_stat = calloc(1, sizeof *pp->a_stat);
@@ -746,10 +726,10 @@ pool_mkpool(unsigned pool_no)
 	Lck_New(&pp->mtx, lck_wq);
 
         /* This needs to be done before herder_thr create */
-	pp->herder_ob_pool = obpool;
-	pp->herder_ob_alloc = oballoc;
-	AN(pp->herder_ob_scratch_pool = orbit_pool_create(NULL, 64 * 1024 * 1024));
-	AZ(orbit_scratch_set_pool(pp->herder_ob_scratch_pool));
+	pp->herder_ob_area = obarea;
+	AN(pp->herder_ob_scratch_area = orbit_area_create(NULL, 64 * 1024 * 1024,
+			orbit_linear_default));
+	AZ(orbit_update_set_area(pp->herder_ob_scratch_area));
 	AN(pp->herder_ob = orbit_create("pool herder", pool_herder_orbit, NULL));
 
 	VTAILQ_INIT(&pp->idle_queue);
@@ -763,7 +743,7 @@ pool_mkpool(unsigned pool_no)
 	VTAILQ_FOREACH(ls, &heritage.socks, list) {
 		if (ls->sock < 0)
 			continue;
-		ALLOC_OBJ_ORBIT(oballoc, ps, POOLSOCK_MAGIC);
+		ALLOC_OBJ_ORBIT(obarea, ps, POOLSOCK_MAGIC);
 		XXXAN(ps);
 		ps->lsock = ls;
 		ps->task.func = pool_accept;
